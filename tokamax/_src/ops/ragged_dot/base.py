@@ -301,6 +301,33 @@ class RaggedDot(op.Op[Any, jax.Array, Residuals, _Config, _Key]):
     return dot_out, residuals if return_residuals else None
 
 
+def _backward_grad_dtype(
+    operand_dtype: jax.typing.DTypeLike,
+    grad_dtype: jax.typing.DTypeLike | None,
+) -> jnp.dtype:
+  """Returns the storage dtype for a backward-pass gradient.
+
+  The backward matmuls keep their (possibly low-precision, e.g. bf16) operands,
+  so the tensor-core multiply is unchanged, but the resulting gradient is
+  accumulated *and stored* in this (wider) dtype. Storing a gradient at the
+  operand dtype (as the VJP previously did via
+  `preferred_element_type=lhs.dtype`/`rhs.dtype`) can round a gradient that is
+  finite in fp32 up to `inf` in bf16 -- the largest bf16 value is 3.3895e38,
+  below the fp32 max of 3.4028e38 -- even when the forward is finite. Defaulting
+  to (at least) fp32 avoids this and matches the accumulation dtype of the
+  forward and of `jax.lax.ragged_dot`'s own VJP.
+
+  Args:
+    operand_dtype: The dtype of the operand whose gradient is being computed.
+    grad_dtype: An explicit override for the gradient storage dtype. If `None`,
+      the operand dtype promoted with fp32 is used (i.e. at least fp32 for float
+      gradients, preserving wider dtypes such as fp64).
+  """
+  if grad_dtype is not None:
+    return jnp.dtype(grad_dtype)
+  return jnp.result_type(operand_dtype, jnp.float32)
+
+
 def vjp(
     residuals: Residuals,
     out: jax.Array,
@@ -315,8 +342,17 @@ def vjp(
     activation: ActivationFunction | None = None,
     dlhs_ragged_dot: Callable[..., jax.Array] = RaggedDot(),
     drhs_ragged_dot: Callable[..., jax.Array] = RaggedDot(),
+    grad_dtype: jax.typing.DTypeLike | None = None,
 ) -> tuple[jax.Array, jax.Array]:
-  """Ragged dot VJP."""
+  """Ragged dot VJP.
+
+  The backward matmuls store their gradients in `grad_dtype` (fp32 by default),
+  independently of the operand dtype, so the bf16 tensor-core multiply is kept
+  while large weight gradients are not rounded (and possibly overflowed to
+  `inf`) through bf16. See `_backward_grad_dtype` for details.
+  """
+  # NOTE: `preferred_element_type` is the *forward* output dtype; the backward
+  # gradients are stored in `grad_dtype` (see `_backward_grad_dtype`) instead.
   del out, preferred_element_type  # Unused.
 
   if activation is not None:
@@ -350,7 +386,7 @@ def vjp(
           rhs_group_dimensions=rhs_group,
       ),
       precision=precision,
-      preferred_element_type=lhs.dtype,
+      preferred_element_type=_backward_grad_dtype(lhs.dtype, grad_dtype),
   )
 
   dot_dim_nums = ((lhs_kept, dout_lhs_kept), (lhs_batch, dout_batch))
@@ -364,6 +400,6 @@ def vjp(
           rhs_group_dimensions=[],
       ),
       precision=precision,
-      preferred_element_type=rhs.dtype,
+      preferred_element_type=_backward_grad_dtype(rhs.dtype, grad_dtype),
   )
   return dlhs, drhs
