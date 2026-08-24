@@ -22,7 +22,6 @@ import types
 from typing import Any, Literal, NotRequired, ParamSpec, TypeVar, TypedDict, cast, overload
 import jax
 from jax import export
-from jax.experimental import shard_map
 import jax.numpy as jnp
 from jax.typing import DTypeLike  # pylint: disable=g-importing-member
 from jaxtyping import Array, Bool, Float, Int  # pylint: disable=g-multiple-import,g-importing-member
@@ -472,8 +471,12 @@ class DotProductAttention(
       is_leaf = lambda x: x is None
       args = jax.tree.map(bcast, args, in_axes, is_leaf=is_leaf)
       in_specs = jax.tree.map(spec, args, in_axes, is_leaf=is_leaf)
-      return shard_map.shard_map(
-          fwd_closed, mesh, in_specs, out_specs, check_rep=False
+      return jax.shard_map(
+          fwd_closed,
+          mesh=mesh,
+          in_specs=in_specs,
+          out_specs=out_specs,
+          check_vma=False,
       )(*args)
 
     return fwd_sharded(

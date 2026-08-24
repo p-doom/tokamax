@@ -13,6 +13,7 @@
 # limitations under the License.
 # ==============================================================================
 import functools
+import warnings
 
 from absl.testing import absltest
 from absl.testing import parameterized
@@ -83,7 +84,9 @@ class ApiShardingTest(parameterized.TestCase):
     q_sharded = jax.device_put(q, sharding)
     k_sharded = jax.device_put(k, sharding)
     v_sharded = jax.device_put(v, sharding)
-    out_ans = f(q_sharded, k_sharded, v_sharded)
+    with warnings.catch_warnings():
+      warnings.simplefilter('error', DeprecationWarning)
+      out_ans = f(q_sharded, k_sharded, v_sharded)
     self.assertEqual(out_ans.sharding, sharding)
     chex.assert_trees_all_close(out_ans, out_ref, atol=0.01, rtol=0.01)
 
