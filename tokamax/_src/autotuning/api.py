@@ -128,6 +128,11 @@ class AutotuningResult:
       key = ba.autotuning_cache_key
       overlay.setdefault(ba.op, {}).setdefault(self.device_kind, {})[key] = data
     state = op_lib.get_autotuning_cache_overlay_state()
+    if any(
+        isinstance(overlay, op_lib._RequiredAutotuningCacheOverlay)  # pylint: disable=protected-access
+        for overlay in state.stack
+    ):
+      raise RuntimeError("Cannot overlay a required autotuning cache")
     state.stack.append(overlay)
     context = state.context(state.context.value + (id(self),))
     context.__enter__()

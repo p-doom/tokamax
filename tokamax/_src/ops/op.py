@@ -381,6 +381,10 @@ _AUTOTUNING_CACHE: dict[
 _AUTOTUNING_CACHE_OVERLAY = threading.local()
 
 
+class _RequiredAutotuningCacheOverlay(dict):
+  pass
+
+
 def get_autotuning_cache_overlay_state() -> Any:
   if not hasattr(_AUTOTUNING_CACHE_OVERLAY, "stack"):
     _AUTOTUNING_CACHE_OVERLAY.stack = []
@@ -510,6 +514,11 @@ class BoundArguments(Generic[_Config, _Key]):
       data = overlay.get(self.op, {}).get(device_kind, {}).get(key)
       if data is not None:
         return data
+      if isinstance(overlay, _RequiredAutotuningCacheOverlay):
+        raise ValueError(
+            f"Required autotuning cache miss for {self.op} on {device_kind} "
+            f"with key {key}"
+        )
 
     try:
       return self.op.get_autotuning_cache()[key]
@@ -550,6 +559,11 @@ class BoundArguments(Generic[_Config, _Key]):
       cache_results: bool = True,
   ) -> AutotuningData[_Config]:
     """Autotunes the op with the bound arguments."""
+    if any(
+        isinstance(overlay, _RequiredAutotuningCacheOverlay)
+        for overlay in get_autotuning_cache_overlay_state().stack
+    ):
+      raise RuntimeError("Autotuning is disabled by the required cache context")
     if configs is AUTO:
       configs = self.autotuning_configs
 
