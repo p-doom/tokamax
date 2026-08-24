@@ -20,6 +20,8 @@ import os
 from pathlib import Path
 import secrets
 import stat
+import subprocess
+import sys
 import threading
 import types
 from typing import Any, ClassVar
@@ -150,6 +152,48 @@ def _load_required(
   return artifact.load_required(capability, identity, _digest("5"))
 
 
+class _PrimaryCompileError(BaseException):
+  pass
+
+
+def _exercise_corrupted_required_stack(failure_stage: str):
+  result, _, op, lowered = _result()
+  required = artifact.RequiredAutotuningCache(
+      result,
+      _identity(result.device_kind, lowered),
+      artifact._LOAD_REQUIRED_TOKEN,  # pylint: disable=protected-access
+  )
+  state = op_lib.get_autotuning_cache_overlay_state()
+  baseline = tuple(state.stack)
+  corruption = object()
+
+  def fail():
+    state.stack.append(corruption)
+    raise _PrimaryCompileError(f"{failure_stage} failed")
+
+  try:
+    if failure_stage == "lower":
+
+      def fail_lower(_value):
+        fail()
+
+      required.compile(jax.jit(fail_lower), jnp.zeros((2, 3), jnp.float32))
+    elif failure_stage == "compile":
+
+      def fail_compile(_lowered):
+        fail()
+
+      with mock.patch.object(type(lowered), "compile", new=fail_compile):
+        required.compile(jax.jit(op), jnp.zeros((2, 3), jnp.float32))
+    else:
+      raise ValueError(f"unknown failure stage: {failure_stage}")
+  except BaseException as error:  # pylint: disable=broad-exception-caught
+    observed = tuple(state.stack)
+    state.stack[:] = baseline
+    return error, observed, baseline
+  raise AssertionError(f"{failure_stage} unexpectedly succeeded")
+
+
 class ArtifactTest(absltest.TestCase):
 
   def setUp(self):
@@ -160,6 +204,41 @@ class ArtifactTest(absltest.TestCase):
   def tearDown(self):
     os.close(self.directory_fd)
     super().tearDown()
+
+  def test_required_cache_cleanup_preserves_primary_in_normal_and_optimized_python(
+      self,
+  ):
+    code = """
+from tokamax._src.autotuning.artifact_test import _exercise_corrupted_required_stack
+from tokamax._src.autotuning.artifact_test import _PrimaryCompileError
+for stage in ("lower", "compile"):
+  error, observed, baseline = _exercise_corrupted_required_stack(stage)
+  if type(error) is not _PrimaryCompileError or str(error) != f"{stage} failed":
+    raise AssertionError(f"primary error replaced for {stage}: {error!r}")
+  if observed != baseline:
+    raise AssertionError(f"stack leaked for {stage}: {observed!r}")
+  notes = getattr(error, "__notes__", ())
+  if len(notes) != 1 or "required autotuning cache stack is corrupted" not in notes[0]:
+    raise AssertionError(f"cleanup error not aggregated for {stage}: {notes!r}")
+"""
+    environment = dict(os.environ)
+    environment["JAX_PLATFORMS"] = "cpu"
+    environment["PYTHONPATH"] = str(Path(__file__).parents[3])
+    for optimized in (False, True):
+      command = [sys.executable]
+      if optimized:
+        command.append("-O")
+      result = subprocess.run(
+          [*command, "-c", code],
+          check=False,
+          env=environment,
+          stdin=subprocess.DEVNULL,
+          capture_output=True,
+          text=True,
+          timeout=90,
+      )
+      with self.subTest(optimized=optimized):
+        self.assertEqual(result.returncode, 0, result.stderr)
 
   def test_publish_and_load_required_cache(self):
     result, bound_args, _, lowered = _result()

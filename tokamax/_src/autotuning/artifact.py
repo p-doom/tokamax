@@ -635,6 +635,21 @@ def _read_capability(capability: RegistrarReadCapability) -> bytes:
     os.close(fd)
 
 
+def _restore_required_stack(state, original_stack, overlay) -> None:
+  stack = state.stack
+  expected_stack = (*original_stack, overlay)
+  intact = type(stack) is list and len(stack) == len(expected_stack) and all(  # pylint: disable=unidiomatic-typecheck
+      observed is expected
+      for observed, expected in zip(stack, expected_stack, strict=True)
+  )
+  if type(stack) is list:  # pylint: disable=unidiomatic-typecheck
+    stack[:] = original_stack
+  else:
+    state.stack = list(original_stack)
+  if not intact:
+    raise RuntimeError("required autotuning cache stack is corrupted")
+
+
 class RequiredAutotuningCache:
   """Single-use sealed-cache lowering and compilation capability."""
 
@@ -684,29 +699,43 @@ class RequiredAutotuningCache:
         for item in state.stack
     ):
       raise RuntimeError("another required autotuning cache capability is active")
+    original_stack = tuple(state.stack)
     state.stack.append(overlay)
     context = state.context(state.context.value + (self._context_token,))
+    primary_error = None
     try:
-      with context:
-        lowered = function.lower(*args, **kwargs)
-        if resolved_keys != expected_keys:
-          raise ValueError(
-              "lowering did not resolve every entry from the sealed cache"
-          )
-        if _lowered_entry_keys(lowered) != expected_keys:
-          raise ValueError(
-              "live lowered program does not exactly match the sealed configs"
-          )
-        if (
-            lowered_program_sha256(lowered)
-            != self._identity.lowered_program_sha256
-        ):
-          raise ValueError("live lowered program does not match the cache identity")
-        return lowered.compile()
+      try:
+        with context:
+          lowered = function.lower(*args, **kwargs)
+          if resolved_keys != expected_keys:
+            raise ValueError(
+                "lowering did not resolve every entry from the sealed cache"
+            )
+          if _lowered_entry_keys(lowered) != expected_keys:
+            raise ValueError(
+                "live lowered program does not exactly match the sealed configs"
+            )
+          if (
+              lowered_program_sha256(lowered)
+              != self._identity.lowered_program_sha256
+          ):
+            raise ValueError(
+                "live lowered program does not match the cache identity"
+            )
+          return lowered.compile()
+      except BaseException as error:  # pylint: disable=broad-exception-caught
+        primary_error = error
+        raise
     finally:
-      if not state.stack or state.stack[-1] is not overlay:
-        raise RuntimeError("required autotuning cache stack is corrupted")
-      state.stack.pop()
+      try:
+        _restore_required_stack(state, original_stack, overlay)
+      except BaseException as cleanup_error:  # pylint: disable=broad-exception-caught
+        if primary_error is None:
+          raise
+        primary_error.add_note(
+            f"Cleanup also failed: {type(cleanup_error).__name__}: "
+            f"{cleanup_error}"
+        )
 
 
 def load_required(
