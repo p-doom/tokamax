@@ -381,8 +381,22 @@ _AUTOTUNING_CACHE: dict[
 _AUTOTUNING_CACHE_OVERLAY = threading.local()
 
 
-class _RequiredAutotuningCacheOverlay(dict):
-  pass
+class _RequiredAutotuningCacheOverlay:
+
+  def __init__(self, data, record):
+    self._data = data
+    self._record = record
+
+  def resolve(self, bound_args: "BoundArguments", device_kind: str):
+    key = bound_args.autotuning_cache_key
+    data = self._data.get(bound_args.op, {}).get(device_kind, {}).get(key)
+    if data is None:
+      raise ValueError(
+          f"Required autotuning cache miss for {bound_args.op} on "
+          f"{device_kind} with key {key}"
+      )
+    self._record(bound_args, data)
+    return data
 
 
 def get_autotuning_cache_overlay_state() -> Any:
@@ -472,6 +486,15 @@ class BoundArguments(Generic[_Config, _Key]):
       A config for the op.
     """
     # TODO: Add logging.
+    if any(
+        isinstance(overlay, _RequiredAutotuningCacheOverlay)
+        for overlay in get_autotuning_cache_overlay_state().stack
+    ):
+      data = self.cached_autotuning_data
+      if data is None or not data.items():
+        raise ValueError("Required autotuning cache entry is empty")
+      return data.fastest_config  # pytype: disable=unbound-type-param
+
     if (config := self.op.config) is not None:
       return config
 
@@ -511,14 +534,11 @@ class BoundArguments(Generic[_Config, _Key]):
     key = self.autotuning_cache_key
 
     for overlay in reversed(get_autotuning_cache_overlay_state().stack):
+      if isinstance(overlay, _RequiredAutotuningCacheOverlay):
+        return overlay.resolve(self, device_kind)
       data = overlay.get(self.op, {}).get(device_kind, {}).get(key)
       if data is not None:
         return data
-      if isinstance(overlay, _RequiredAutotuningCacheOverlay):
-        raise ValueError(
-            f"Required autotuning cache miss for {self.op} on {device_kind} "
-            f"with key {key}"
-        )
 
     try:
       return self.op.get_autotuning_cache()[key]

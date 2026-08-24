@@ -16,7 +16,6 @@
 
 from __future__ import annotations
 
-import contextlib
 import ctypes
 import dataclasses
 import errno
@@ -28,10 +27,12 @@ import os
 import re
 import secrets
 import stat
+import threading
 from typing import Any, Final, Protocol, Self
 
 import jax
 from tokamax._src import benchmarking
+from tokamax._src import hlo_utils
 from tokamax._src.autotuning import api
 from tokamax._src.autotuning import autotuner
 from tokamax._src.ops import op as op_lib
@@ -50,6 +51,7 @@ _OUTPUT_NAME_RE: Final[re.Pattern[str]] = re.compile(
     r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}\.json"
 )
 _RENAME_NOREPLACE: Final[int] = 1
+_LOAD_REQUIRED_TOKEN: Final[object] = object()
 
 
 def _require_digest(name: str, value: Any) -> str:
@@ -171,6 +173,13 @@ def _reject_constant(value: str) -> None:
   raise ValueError(f"non-finite JSON number is forbidden: {value}")
 
 
+def _parse_float(value: str) -> float:
+  parsed = float(value)
+  if not math.isfinite(parsed):
+    raise ValueError(f"non-finite JSON number is forbidden: {value}")
+  return parsed
+
+
 def _object_without_duplicates(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
   result = {}
   for key, value in pairs:
@@ -191,6 +200,7 @@ def _strict_json(data: bytes | str) -> Any:
       text,
       object_pairs_hook=_object_without_duplicates,
       parse_constant=_reject_constant,
+      parse_float=_parse_float,
   )
 
 
@@ -301,14 +311,34 @@ def _canonical_result(result: api.AutotuningResult) -> str:
   return payload
 
 
-def _bound_args_key(bound_args: op_lib.BoundArguments) -> bytes:
-  normalized = bound_args.replace(
-      op=bound_args.op.replace(config=None, vjp=None)
+def _configured_bound_args_key(
+    bound_args: op_lib.BoundArguments, config: Any
+) -> bytes:
+  configured = bound_args.replace(
+      op=bound_args.op.replace(config=config, vjp=None)
   )
-  value = _strict_json(op_lib.BOUND_ARGS_ADAPTER.dump_json(normalized))
-  del value["op"]["config"]
-  del value["op"]["vjp"]
+  value = _strict_json(op_lib.BOUND_ARGS_ADAPTER.dump_json(configured))
   return _canonical_json(value)
+
+
+def _result_entry_keys(result: api.AutotuningResult) -> set[bytes]:
+  keys = set()
+  for bound_args, data in result.data:
+    if len(data) != 1:
+      raise ValueError("sealed autotuning data must contain exactly one config")
+    config = next(iter(data))
+    key = _configured_bound_args_key(bound_args, config)
+    if key in keys:
+      raise ValueError("sealed autotuning data contains a duplicate configured op")
+    keys.add(key)
+  return keys
+
+
+def _lowered_entry_keys(lowered: jax.stages.Lowered) -> set[bytes]:
+  return {
+      _configured_bound_args_key(bound_args, bound_args.op.config)
+      for bound_args in hlo_utils.get_opspecs(lowered)
+  }
 
 
 def _artifact_bytes(
@@ -325,12 +355,12 @@ def _artifact_bytes(
         f"identity {identity.device_kind!r}"
     )
   payload = _canonical_result(result)
-  result_keys = {_bound_args_key(bound_args) for bound_args, _ in result.data}
-  lowered_keys = {
-      _bound_args_key(bound_args) for bound_args in api.get_bound_args(lowered)
-  }
+  result_keys = _result_entry_keys(result)
+  lowered_keys = _lowered_entry_keys(lowered)
   if result_keys != lowered_keys:
-    raise ValueError("autotuning result does not exactly cover the lowered program")
+    raise ValueError(
+        "autotuning result does not exactly match the configured lowered program"
+    )
   return _canonical_json({
       "schema": ARTIFACT_KIND,
       "identity": identity.as_dict(),
@@ -512,13 +542,15 @@ def build_candidate(
     completed = True
     return PublishedArtifact(len(data), _sha256(data), identity.sha256)
   finally:
-    if temporary_fd is not None:
-      os.close(temporary_fd)
-    if temporary_stat is not None:
-      _unlink_owned_name(directory_fd, temporary_name, temporary_stat)
-      if not completed:
-        _unlink_owned_name(directory_fd, output_name, temporary_stat)
-    os.close(directory_fd)
+    try:
+      if temporary_fd is not None:
+        os.close(temporary_fd)
+      if temporary_stat is not None:
+        _unlink_owned_name(directory_fd, temporary_name, temporary_stat)
+        if not completed:
+          _unlink_owned_name(directory_fd, output_name, temporary_stat)
+    finally:
+      os.close(directory_fd)
 
 
 def _pread_exact(fd: int, size: int) -> bytes:
@@ -603,68 +635,78 @@ def _read_capability(capability: RegistrarReadCapability) -> bytes:
     os.close(fd)
 
 
-class RequiredAutotuningCache(contextlib.AbstractContextManager):
-  """Exclusive cache overlay that rejects every cache miss."""
+class RequiredAutotuningCache:
+  """Single-use sealed-cache lowering and compilation capability."""
 
   def __init__(
-      self, result: api.AutotuningResult, identity: ExecutionIdentity
+      self,
+      result: api.AutotuningResult,
+      identity: ExecutionIdentity,
+      token: object,
   ):
+    if token is not _LOAD_REQUIRED_TOKEN:
+      raise RuntimeError("required caches must be created by load_required")
     self._result = result
     self._identity = identity
-    self._overlay = None
-    self._context = None
-    self._verified = False
+    self._context_token = object()
+    self._claim_lock = threading.Lock()
+    self._claimed = False
 
-  def __enter__(self) -> Self:
-    if self._overlay is not None:
-      raise RuntimeError("required autotuning cache context is already active")
-    overlay = {}
-    for bound_args, data in self._result.data:
+  def compile(self, function: jax.stages.Wrapped, *args, **kwargs):
+    """Lowers and compiles one exact program under this sealed cache."""
+    if not isinstance(function, jax.stages.Wrapped):
+      raise TypeError("function must be an exact jax.stages.Wrapped")
+    with self._claim_lock:
+      if self._claimed:
+        raise RuntimeError("required autotuning cache capability is already consumed")
+      self._claimed = True
+    _verify_live_environment(self._identity)
+    expected_keys = _result_entry_keys(self._result)
+    resolved_keys = set()
+
+    def record(bound_args, data):
+      if len(data) != 1:
+        raise RuntimeError("sealed autotuning cache entry is not singular")
+      resolved_keys.add(_configured_bound_args_key(bound_args, next(iter(data))))
+
+    data = {}
+    for bound_args, tuning_data in self._result.data:
       key = bound_args.autotuning_cache_key
-      overlay.setdefault(bound_args.op, {}).setdefault(
+      data.setdefault(bound_args.op, {}).setdefault(
           self._result.device_kind, {}
-      )[key] = data
-    overlay = op_lib._RequiredAutotuningCacheOverlay(overlay)  # pylint: disable=protected-access
+      )[key] = tuning_data
+    overlay = op_lib._RequiredAutotuningCacheOverlay(  # pylint: disable=protected-access
+        data, record
+    )
     state = op_lib.get_autotuning_cache_overlay_state()
     if any(
         isinstance(item, op_lib._RequiredAutotuningCacheOverlay)  # pylint: disable=protected-access
         for item in state.stack
     ):
-      raise RuntimeError("another required autotuning cache context is active")
+      raise RuntimeError("another required autotuning cache capability is active")
     state.stack.append(overlay)
-    context = state.context(state.context.value + (id(self),))
+    context = state.context(state.context.value + (self._context_token,))
     try:
-      context.__enter__()
-    except BaseException:
-      state.stack.pop()
-      raise
-    self._overlay = overlay
-    self._context = context
-    return self
-
-  def verify_lowered(self, lowered: jax.stages.Lowered) -> None:
-    if self._overlay is None:
-      raise RuntimeError("required autotuning cache context is not active")
-    if lowered_program_sha256(lowered) != self._identity.lowered_program_sha256:
-      raise ValueError("live lowered program does not match the cache identity")
-    self._verified = True
-
-  def __exit__(self, exc_type, exc_value, traceback):
-    if self._overlay is None or self._context is None:
-      raise RuntimeError("required autotuning cache context is not active")
-    state = op_lib.get_autotuning_cache_overlay_state()
-    if not state.stack or state.stack[-1] is not self._overlay:
-      raise RuntimeError("required autotuning cache stack is corrupted")
-    verified = self._verified
-    try:
-      self._context.__exit__(exc_type, exc_value, traceback)
+      with context:
+        lowered = function.lower(*args, **kwargs)
+        if resolved_keys != expected_keys:
+          raise ValueError(
+              "lowering did not resolve every entry from the sealed cache"
+          )
+        if _lowered_entry_keys(lowered) != expected_keys:
+          raise ValueError(
+              "live lowered program does not exactly match the sealed configs"
+          )
+        if (
+            lowered_program_sha256(lowered)
+            != self._identity.lowered_program_sha256
+        ):
+          raise ValueError("live lowered program does not match the cache identity")
+        return lowered.compile()
     finally:
+      if not state.stack or state.stack[-1] is not overlay:
+        raise RuntimeError("required autotuning cache stack is corrupted")
       state.stack.pop()
-      self._overlay = None
-      self._context = None
-      self._verified = False
-    if exc_type is None and not verified:
-      raise RuntimeError("live lowered program was not verified")
 
 
 def load_required(
@@ -715,4 +757,4 @@ def load_required(
     raise ValueError("autotuning cache payload encoding is not canonical")
   if result.device_kind != expected_identity.device_kind:
     raise ValueError("autotuning result device kind mismatch")
-  return RequiredAutotuningCache(result, identity)
+  return RequiredAutotuningCache(result, identity, _LOAD_REQUIRED_TOKEN)

@@ -19,6 +19,8 @@ import json
 import os
 from pathlib import Path
 import secrets
+import stat
+import threading
 import types
 from typing import Any, ClassVar
 from unittest import mock
@@ -92,7 +94,6 @@ def _result() -> tuple[
 ]:
   op = _FakeOp()
   shape = jax.ShapeDtypeStruct((2, 3), jnp.float32)
-  lowered = jax.jit(lambda value: value + 1).lower(shape)
   bound_args = op.bind(shape)
   benchmark = benchmarking.BenchmarkData(
       compile_time_ms=1.0,
@@ -103,12 +104,10 @@ def _result() -> tuple[
   )
   data = autotuner.AutotuningData({_FakeConfig(7): benchmark})
   device_kind = jax.devices()[0].device_kind
-  return (
-      api.AutotuningResult(device_kind, ((bound_args, data),)),
-      bound_args,
-      op,
-      lowered,
-  )
+  result = api.AutotuningResult(device_kind, ((bound_args, data),))
+  with result:
+    lowered = jax.jit(op).lower(shape)
+  return result, bound_args, op, lowered
 
 
 def _publish(
@@ -118,11 +117,7 @@ def _publish(
     directory_fd: int,
     name: str,
 ) -> artifact.PublishedArtifact:
-  bound_args = tuple(item[0] for item in result.data)
-  with mock.patch.object(api, "get_bound_args", return_value=bound_args):
-    return artifact.build_candidate(
-        result, identity, lowered, directory_fd, name
-    )
+  return artifact.build_candidate(result, identity, lowered, directory_fd, name)
 
 
 def _capability(
@@ -181,11 +176,11 @@ class ArtifactTest(absltest.TestCase):
       os.lseek(fd, 1, os.SEEK_SET)
       required = _load_required(_capability(fd, published), identity)
       self.assertEqual(os.lseek(fd, 0, os.SEEK_CUR), 1)
-      with required:
-        required.verify_lowered(lowered)
-        self.assertEqual(bound_args.default_config, _FakeConfig(7))
-        output = jax.jit(bound_args.op)(jnp.zeros((2, 3), jnp.float32))
-        self.assertEqual(jax.device_get(output).tolist(), [[7.0] * 3] * 2)
+      compiled = required.compile(
+          jax.jit(bound_args.op), jnp.zeros((2, 3), jnp.float32)
+      )
+      output = compiled(jnp.zeros((2, 3), jnp.float32))
+      self.assertEqual(jax.device_get(output).tolist(), [[7.0] * 3] * 2)
       self.assertEqual(bound_args.default_config, _FakeConfig(99))
     finally:
       os.close(fd)
@@ -208,6 +203,10 @@ class ArtifactTest(absltest.TestCase):
             ),
         ),
     )
+    with result:
+      lowered = jax.jit(bound_args.op).lower(
+          jax.ShapeDtypeStruct((2, 3), jnp.float32)
+      )
     identity = _identity(result.device_kind, lowered)
     published = _publish(
         result, identity, lowered, self.directory_fd, "cache.json"
@@ -215,9 +214,11 @@ class ArtifactTest(absltest.TestCase):
     fd = os.open(self.directory / "cache.json", os.O_RDONLY | os.O_NOFOLLOW)
     try:
       required = _load_required(_capability(fd, published), identity)
-      with required:
-        required.verify_lowered(lowered)
-        self.assertEqual(bound_args.default_config, _FakeConfig(8))
+      compiled = required.compile(
+          jax.jit(bound_args.op), jnp.zeros((2, 3), jnp.float32)
+      )
+      output = compiled(jnp.zeros((2, 3), jnp.float32))
+      self.assertEqual(jax.device_get(output).tolist(), [[8.0] * 3] * 2)
     finally:
       os.close(fd)
 
@@ -236,14 +237,32 @@ class ArtifactTest(absltest.TestCase):
     fd = os.open(self.directory / "cache.json", os.O_RDONLY | os.O_NOFOLLOW)
     try:
       required = _load_required(_capability(fd, published), identity)
-      with required:
-        required.verify_lowered(lowered)
-        with self.assertRaisesRegex(ValueError, "Required autotuning cache miss"):
-          _ = missing.default_config
-        with self.assertRaisesRegex(RuntimeError, "Autotuning is disabled"):
-          missing.autotune({_FakeConfig(9)})
-        with self.assertRaisesRegex(RuntimeError, "Cannot overlay"):
-          result.__enter__()
+      with self.assertRaisesRegex(ValueError, "Required autotuning cache miss"):
+        required.compile(
+            jax.jit(op), jnp.zeros((7, 11), jnp.float32)
+        )
+
+      def autotune_during_lowering(value):
+        op.bind(value).autotune({_FakeConfig(9)})
+        return value
+
+      required = _load_required(_capability(fd, published), identity)
+      with self.assertRaisesRegex(RuntimeError, "Autotuning is disabled"):
+        required.compile(
+            jax.jit(autotune_during_lowering),
+            jnp.zeros((2, 3), jnp.float32),
+        )
+
+      def overlay_during_lowering(value):
+        with result:
+          return value
+
+      required = _load_required(_capability(fd, published), identity)
+      with self.assertRaisesRegex(RuntimeError, "Cannot overlay"):
+        required.compile(
+            jax.jit(overlay_during_lowering),
+            jnp.zeros((2, 3), jnp.float32),
+        )
     finally:
       os.close(fd)
 
@@ -261,6 +280,95 @@ class ArtifactTest(absltest.TestCase):
       )
     self.assertEqual(target.read_bytes(), b"existing")
     self.assertEqual({path.name for path in self.directory.iterdir()}, {"cache.json"})
+
+  def test_publish_fsyncs_file_and_directory_around_rename(self):
+    result, _, _, lowered = _result()
+    events = []
+    original_fsync = artifact.os.fsync
+    original_rename = artifact._rename_noreplace  # pylint: disable=protected-access
+
+    def fsync(fd):
+      role = "directory" if stat.S_ISDIR(os.fstat(fd).st_mode) else "file"
+      events.append(f"fsync_{role}")
+      original_fsync(fd)
+
+    def rename(*args):
+      events.append("rename_noreplace")
+      original_rename(*args)
+
+    with mock.patch.object(artifact.os, "fsync", side_effect=fsync), mock.patch.object(
+        artifact, "_rename_noreplace", side_effect=rename
+    ):
+      _publish(
+          result,
+          _identity(result.device_kind, lowered),
+          lowered,
+          self.directory_fd,
+          "cache.json",
+      )
+    self.assertEqual(
+        events,
+        [
+            "fsync_file",
+            "fsync_directory",
+            "rename_noreplace",
+            "fsync_directory",
+        ],
+    )
+
+  def test_concurrent_publish_has_one_winner_and_no_temporary(self):
+    result, _, _, lowered = _result()
+    identity = _identity(result.device_kind, lowered)
+    barrier = threading.Barrier(2)
+    original_rename = artifact._rename_noreplace  # pylint: disable=protected-access
+    published = []
+    errors = []
+
+    def rename(*args):
+      barrier.wait(timeout=10)
+      original_rename(*args)
+
+    def publish():
+      try:
+        published.append(
+            _publish(
+                result,
+                identity,
+                lowered,
+                self.directory_fd,
+                "cache.json",
+            )
+        )
+      except BaseException as error:  # pylint: disable=broad-exception-caught
+        errors.append(error)
+
+    with mock.patch.object(artifact, "_rename_noreplace", side_effect=rename):
+      threads = [threading.Thread(target=publish) for _ in range(2)]
+      for thread in threads:
+        thread.start()
+      for thread in threads:
+        thread.join(timeout=20)
+    self.assertTrue(all(not thread.is_alive() for thread in threads))
+    self.assertLen(published, 1)
+    self.assertLen(errors, 1)
+    self.assertIsInstance(errors[0], FileExistsError)
+    self.assertEqual([path.name for path in self.directory.iterdir()], ["cache.json"])
+    self.assertEqual(
+        hashlib.sha256((self.directory / "cache.json").read_bytes()).hexdigest(),
+        published[0].sha256,
+    )
+
+  def test_publish_rejects_path_output_name(self):
+    result, _, _, lowered = _result()
+    with self.assertRaisesRegex(ValueError, "ASCII .json component"):
+      _publish(
+          result,
+          _identity(result.device_kind, lowered),
+          lowered,
+          self.directory_fd,
+          "../cache.json",
+      )
+    self.assertEmpty(list(self.directory.iterdir()))
 
   def test_publish_uses_held_directory(self):
     held = self.directory.with_name(f"held-{secrets.token_hex(8)}")
@@ -292,6 +400,43 @@ class ArtifactTest(absltest.TestCase):
         )
     self.assertEmpty(list(self.directory.iterdir()))
 
+  def test_publish_cleanup_failure_closes_held_directory(self):
+    result, _, _, lowered = _result()
+    duplicated = []
+    closed = []
+    original_fcntl = artifact.fcntl.fcntl
+    original_close = artifact.os.close
+
+    def fcntl_call(fd, command, *args):
+      result_fd = original_fcntl(fd, command, *args)
+      if command == artifact.fcntl.F_DUPFD_CLOEXEC:
+        duplicated.append(result_fd)
+      return result_fd
+
+    def close(fd):
+      closed.append(fd)
+      original_close(fd)
+
+    with mock.patch.object(
+        artifact, "_rename_noreplace", side_effect=OSError("publish failed")
+    ), mock.patch.object(
+        artifact, "_unlink_owned_name", side_effect=OSError("cleanup failed")
+    ), mock.patch.object(
+        artifact.fcntl, "fcntl", side_effect=fcntl_call
+    ), mock.patch.object(
+        artifact.os, "close", side_effect=close
+    ):
+      with self.assertRaisesRegex(OSError, "cleanup failed"):
+        _publish(
+            result,
+            _identity(result.device_kind, lowered),
+            lowered,
+            self.directory_fd,
+            "cache.json",
+        )
+    self.assertLen(duplicated, 1)
+    self.assertIn(duplicated[0], closed)
+
   def test_publish_write_failure_removes_owned_temporary(self):
     result, _, _, lowered = _result()
     with mock.patch.object(artifact.os, "write", side_effect=OSError("injected")):
@@ -320,15 +465,51 @@ class ArtifactTest(absltest.TestCase):
         )
     self.assertEmpty(list(self.directory.iterdir()))
 
-  def test_publish_rejects_incomplete_lowered_program_coverage(self):
-    result, _, _, lowered = _result()
+  def test_publish_rejects_lowering_with_different_config(self):
+    result, _, op, _ = _result()
+    lowered = jax.jit(op).lower(
+        jax.ShapeDtypeStruct((2, 3), jnp.float32)
+    )
     identity = _identity(result.device_kind, lowered)
-    with mock.patch.object(api, "get_bound_args", return_value=()):
-      with self.assertRaisesRegex(ValueError, "exactly cover"):
-        artifact.build_candidate(
-            result, identity, lowered, self.directory_fd, "cache.json"
-        )
+    with self.assertRaisesRegex(ValueError, "configured lowered program"):
+      artifact.build_candidate(
+          result, identity, lowered, self.directory_fd, "cache.json"
+      )
     self.assertEmpty(list(self.directory.iterdir()))
+
+  def test_required_cache_rejects_sealed_config_identity_mismatch(self):
+    result, _, op, lowered = _result()
+    identity = _identity(result.device_kind, lowered)
+    published = _publish(
+        result, identity, lowered, self.directory_fd, "cache.json"
+    )
+    wrong_lowered = jax.jit(op).lower(
+        jax.ShapeDtypeStruct((2, 3), jnp.float32)
+    )
+    wrong_identity = dataclasses.replace(
+        identity,
+        lowered_program_sha256=artifact.lowered_program_sha256(wrong_lowered),
+    )
+    target = self.directory / "cache.json"
+    value = artifact._strict_json(target.read_bytes())  # pylint: disable=protected-access
+    value["identity"] = wrong_identity.as_dict()
+    value["identity_sha256"] = wrong_identity.sha256
+    data = artifact._canonical_json(value)  # pylint: disable=protected-access
+    target.chmod(0o600)
+    target.write_bytes(data)
+    target.chmod(0o400)
+    forged = artifact.PublishedArtifact(
+        len(data), hashlib.sha256(data).hexdigest(), wrong_identity.sha256
+    )
+    fd = os.open(target, os.O_RDONLY | os.O_NOFOLLOW)
+    try:
+      required = _load_required(_capability(fd, forged), wrong_identity)
+      with self.assertRaisesRegex(ValueError, "cache identity"):
+        required.compile(
+            jax.jit(op), jnp.zeros((2, 3), jnp.float32)
+        )
+    finally:
+      os.close(fd)
 
   def test_load_uses_held_file_after_path_swap(self):
     result, _, _, lowered = _result()
@@ -342,8 +523,9 @@ class ArtifactTest(absltest.TestCase):
       target.rename(self.directory / "held.json")
       target.write_bytes(b"replacement")
       required = _load_required(_capability(fd, published), identity)
-      with required:
-        required.verify_lowered(lowered)
+      required.compile(
+          jax.jit(result.data[0][0].op), jnp.zeros((2, 3), jnp.float32)
+      )
     finally:
       os.close(fd)
 
@@ -361,8 +543,8 @@ class ArtifactTest(absltest.TestCase):
     finally:
       os.close(fd)
 
-  def test_required_cache_requires_live_lowered_verification(self):
-    result, _, _, lowered = _result()
+  def test_required_cache_rejects_mixed_live_program(self):
+    result, _, op, lowered = _result()
     identity = _identity(result.device_kind, lowered)
     published = _publish(
         result, identity, lowered, self.directory_fd, "cache.json"
@@ -370,15 +552,96 @@ class ArtifactTest(absltest.TestCase):
     fd = os.open(self.directory / "cache.json", os.O_RDONLY | os.O_NOFOLLOW)
     try:
       required = _load_required(_capability(fd, published), identity)
-      with self.assertRaisesRegex(RuntimeError, "was not verified"):
-        with required:
-          pass
-      wrong = jax.jit(lambda value: value + 2).lower(
-          jax.ShapeDtypeStruct((2, 3), jnp.float32)
+      with self.assertRaisesRegex(TypeError, "exact jax.stages.Wrapped"):
+        required.compile(lowered)
+      with self.assertRaisesRegex(ValueError, "cache identity"):
+        required.compile(
+            jax.jit(lambda value: op(value) + 2),
+            jnp.zeros((2, 3), jnp.float32),
+        )
+    finally:
+      os.close(fd)
+
+  def test_required_cache_rejects_explicit_config_bypass(self):
+    result, _, op, lowered = _result()
+    identity = _identity(result.device_kind, lowered)
+    published = _publish(
+        result, identity, lowered, self.directory_fd, "cache.json"
+    )
+    fd = os.open(self.directory / "cache.json", os.O_RDONLY | os.O_NOFOLLOW)
+    try:
+      required = _load_required(_capability(fd, published), identity)
+      configured = op.replace(config=_FakeConfig(7))
+      with self.assertRaisesRegex(ValueError, "Required autotuning cache miss"):
+        required.compile(
+            jax.jit(configured), jnp.zeros((2, 3), jnp.float32)
+        )
+    finally:
+      os.close(fd)
+
+  def test_required_cache_rejects_unused_sealed_entry(self):
+    result, _, op, _ = _result()
+    second_shape = jax.ShapeDtypeStruct((7, 11), jnp.float32)
+    second_bound_args = op.bind(second_shape)
+    tuning_data = result.data[0][1]
+    result = dataclasses.replace(
+        result, data=(*result.data, (second_bound_args, tuning_data))
+    )
+    with result:
+      lowered = jax.jit(lambda first, second: (op(first), op(second))).lower(
+          jax.ShapeDtypeStruct((2, 3), jnp.float32), second_shape
       )
-      with self.assertRaisesRegex(ValueError, "live lowered program"):
-        with required:
-          required.verify_lowered(wrong)
+    identity = _identity(result.device_kind, lowered)
+    published = _publish(
+        result, identity, lowered, self.directory_fd, "cache.json"
+    )
+    fd = os.open(self.directory / "cache.json", os.O_RDONLY | os.O_NOFOLLOW)
+    try:
+      required = _load_required(_capability(fd, published), identity)
+      with self.assertRaisesRegex(ValueError, "every entry"):
+        required.compile(
+            jax.jit(op), jnp.zeros((2, 3), jnp.float32)
+        )
+    finally:
+      os.close(fd)
+
+  def test_required_cache_is_single_use_nested_safe_and_does_not_escape(self):
+    result, bound_args, op, lowered = _result()
+    identity = _identity(result.device_kind, lowered)
+    published = _publish(
+        result, identity, lowered, self.directory_fd, "cache.json"
+    )
+    fd = os.open(self.directory / "cache.json", os.O_RDONLY | os.O_NOFOLLOW)
+    try:
+      outer = _load_required(_capability(fd, published), identity)
+      nested = _load_required(_capability(fd, published), identity)
+
+      def enter_nested(value):
+        nested.compile(jax.jit(op), value)
+        return op(value)
+
+      with self.assertRaisesRegex(RuntimeError, "another required"):
+        outer.compile(
+            jax.jit(enter_nested), jnp.zeros((2, 3), jnp.float32)
+        )
+      self.assertEmpty(op_lib.get_autotuning_cache_overlay_state().stack)
+
+      required = _load_required(_capability(fd, published), identity)
+      with self.assertRaises(TypeError):
+        with required:  # type: ignore[attr-defined]
+          pass
+      compiled = required.compile(
+          jax.jit(op), jnp.zeros((2, 3), jnp.float32)
+      )
+      output = compiled(jnp.zeros((2, 3), jnp.float32))
+      self.assertEqual(jax.device_get(output).tolist(), [[7.0] * 3] * 2)
+      self.assertEqual(bound_args.default_config, _FakeConfig(99))
+      self.assertEmpty(op_lib.get_autotuning_cache_overlay_state().stack)
+      with self.assertRaisesRegex(RuntimeError, "already consumed"):
+        required.compile(
+            jax.jit(op), jnp.zeros((2, 3), jnp.float32)
+        )
+      self.assertFalse(hasattr(required, "verify_lowered"))
     finally:
       os.close(fd)
 
@@ -485,6 +748,8 @@ class ArtifactTest(absltest.TestCase):
       artifact._strict_json('{"value":1,"value":2}')  # pylint: disable=protected-access
     with self.assertRaisesRegex(ValueError, "non-finite"):
       artifact._strict_json('{"value":NaN}')  # pylint: disable=protected-access
+    with self.assertRaisesRegex(ValueError, "non-finite"):
+      artifact._strict_json('{"value":1e400}')  # pylint: disable=protected-access
 
   def test_identity_rejects_bool_count_and_placeholder(self):
     result, _, _, lowered = _result()
